@@ -254,6 +254,58 @@ class FluxTaskManager(TaskManager):
                           self._cdata.flowLog,
                           task.setRunstate)
 
+    @lockMethod
+    def harvestTasks(self) :
+        """
+        Check the set of running tasks to see if they've completed and update
+        Node status accordingly:
+        """
+        notrunning = set()
+        for task in self.runningTasks.keys() :
+            if self.stopped() : break
+            trun = self.runningTasks[task]
+            if not task.runStatus.isComplete.isSet() :
+                if trun.isAlive() : continue
+                # if not complete and thread is dead then we don't know what happened, very bad!:
+                task.errorstate = 1
+                task.errorMessage = "Thread: '%s', has stopped without a traceable cause" % (trun.getName())
+            else :
+                task.errorstate = task.runStatus.errorCode
+                task.errorMessage = task.runStatus.errorMessage
+
+            if task.errorstate == 0 :
+                task.setRunstate("complete")
+            else:
+                task.setRunstate("error")
+
+            notrunning.add(task)
+
+            if not task.isError() :
+                self._infoLog("Completed %s: '%s' launched from %s" % (task.payload.desc(), task.fullLabel(), namespaceLabel(task.namespace)))
+            else:
+                msg = task.getTaskErrorMsg()
+
+                if self._cdata.isTaskSubmissionActive() :
+                    # if this is the first error in the workflow, then
+                    # we elaborate a bit on the workflow's response to
+                    # the error. We also send any email-notifications
+                    # for the first error only:
+                    msg.extend(["Shutting down task submission. Waiting for remaining tasks to complete."])
+
+                self._errorLog(msg)
+                if self._cdata.isTaskSubmissionActive() :
+                    self._cdata.emailNotification(msg, self._flowLog)
+
+                # Be sure to send notifications *before* setting error
+                # bits, because the WorkflowRunner may decide to
+                # immediately shutdown all tasks and pyflow threads on
+                # the first error:
+                self._cdata.setTaskError(task)
+
+        # recover task resources:
+        for task in notrunning :
+            self._removeTaskFromRunningSet(task)
+
 
 class FluxTaskRunner(SGETaskRunner):
 
@@ -261,19 +313,17 @@ class FluxTaskRunner(SGETaskRunner):
     def getFullCmd(self):
         # qsub options
         #
-        qsubCmd = ['echo', '"{}"'.format(' '.join(self.wrapperCmd)), '|',
+        qsubCmd = ['echo', '"{} {}"'.format(sys.executable, ' '.join(self.wrapperCmd)), '|',
                  "qsub",
                  "-V",  # import environment variables from shell
                  #"-cwd",  # use current working directory
                  "-q", 'fluxm',
-                 "-S", sys.executable,  # The taskwrapper script is python
+                 #"-S", sys.executable,  # The taskwrapper script is python
                  "-o", self.wrapFile,
                  "-e", self.wrapFile]
 
         qsubCmd.extend(self.schedulerArgList)
 
-        print qsubCmd
-        print ' '.join(qsubCmd)
         return tuple(qsubCmd)
 
     def runOnce(self, retInfo) :
@@ -282,7 +332,7 @@ class FluxTaskRunner(SGETaskRunner):
             maxQcallWait = 180
             qcall = None
             for i in range(maxQcallAttempt) :
-                qcall = QCaller(cmd,self.infoLog)
+                qcall = FluxQCaller(cmd,self.infoLog)
                 qcall.start()
                 qcall.join(maxQcallWait)
                 if not qcall.isAlive() : break
@@ -313,7 +363,6 @@ class FluxTaskRunner(SGETaskRunner):
         else :
             w = results.outList[0].split('.')
             if (len(w) > 3) and (w[2] == "arc-ts") and (w[3] == "umich") :
-                print 'jobId: {}'.format(w[0])
                 self.setNewJobId(int(w[0]))
             else :
                 isQsubError = True
@@ -333,11 +382,11 @@ class FluxTaskRunner(SGETaskRunner):
             retInfo.taskExitMsg = ["Job submission failure -- qsub returned exit code: %i" % (retInfo.retval)]
             return retInfo
 
-        # No qsub errors detected and an sge job_number is acquired -- success!
-        self.infoLog("Task submitted to sge queue with job_number: %i" % (self.jobId))
+        # No qsub errors detected and a flux job_number is acquired -- success!
+        self.infoLog("Task submitted to flux queue with job_number: %i" % (self.jobId))
 
 
-        # 2) poll jobId until sge indicates it's not running or queued:
+        # 2) poll jobId until flux indicates it's not running or queued:
         #
         queueStatus = Bunch(isQueued=True, runStartTimeStamp=None)
 
@@ -362,20 +411,18 @@ class FluxTaskRunner(SGETaskRunner):
         # exponential polling times -- make small jobs responsive but give sge a break on long runs...
         ewaiter = ExpWaiter(5, 1.7, 60)
 
-        pollCmd = ("/bin/bash", "--noprofile", "-o", "pipefail", "-c", "qstat -j %i | awk '/^error reason/'" % (self.jobId))
+        pollCmd = ("/bin/bash", "--noprofile", "-o", "pipefail", "-c", "qstat | grep {}".format(self.jobId, self.jobId))
         while not self.stopped():
             results = qcallWithTimeouts(pollCmd, 6)
             isQstatError = False
-            if results.retval != 0:
-                if ((len(results.outList) == 2) and
-                     (results.outList[0].strip() == "Following jobs do not exist:") and
-                     (int(results.outList[1]) == self.jobId)) :
-                    break
-                else :
-                    isQstatError = True
-            else :
-                if (len(results.outList) != 0) :
-                    isQstatError = True
+            job_completed = False
+            try:
+                tokens = results.outList[0].split()
+            except:
+                continue
+
+            if len(tokens) != 6: continue
+            if tokens[4] == 'C': break # task is complete
 
             if isQstatError :
                 if not results.isComplete :
@@ -431,7 +478,7 @@ class Runner(FluxWorkflowRunner):
 
     def workflow(self):
         """ method invoked on class instance run call """
-        self.addTask("tmp", command=['echo', '"Base Analysis Workflow: Running with a maximum of {} cores"'.format(self.num_cpu)])
+        self.addTask("echo", command=['echo', '"Base Analysis Workflow: Running with a maximum of {} cores"'.format(self.num_cpu)])
 
 
 @click.command()
