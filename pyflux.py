@@ -4,9 +4,32 @@ import random
 import string
 
 import click
-from pyflow import WorkflowRunner, CommandTaskRunner, TaskManager, WorkflowRunnerThreadSharedData
+from pyflow import WorkflowRunner, CommandTaskRunner, TaskManager, WorkflowRunnerThreadSharedData, QCaller
 from pyflow import *
 from subprocess import call
+
+
+class FluxQCaller(QCaller):
+    def run(self):
+        GlobalSync.subprocessControl.acquire()
+        try :
+            tmp_proc = subprocess.Popen(' '.join(self.cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=True)
+            self.lock.acquire()
+            try:
+                self.proc = tmp_proc
+                # handle the case where Popen was taking its good sweet time and a killProc() was sent in the meantime:
+                if self.is_kill_attempt: self.killProc()
+            finally:
+                self.lock.release()
+
+            if self.is_kill_attempt: return
+
+            for line in self.proc.stdout :
+                self.results.outList.append(line)
+            self.results.retval = self.proc.wait()
+        finally:
+            GlobalSync.subprocessControl.release()
+        self.results.isComplete = True
 
 
 class FluxRunMode(object):
@@ -131,7 +154,6 @@ class FluxWorkflowRunnerThreadSharedData(WorkflowRunnerThreadSharedData):
             checkSgeProg("qsub")
             checkSgeProg("qstat")
 
-
         stateDir = os.path.join(param.dataDir, "state")
         if param.isContinue == "Auto" :
             param.isContinue = os.path.exists(stateDir)
@@ -143,8 +165,6 @@ class FluxWorkflowRunnerThreadSharedData(WorkflowRunnerThreadSharedData):
         for email in param.mailTo :
             if not verifyEmailAddy(email):
                 raise Exception("Invalid email address: '%s'" % (email))
-
-
 
 
 class FluxTaskManager(TaskManager):
@@ -241,20 +261,166 @@ class FluxTaskRunner(SGETaskRunner):
     def getFullCmd(self):
         # qsub options
         #
-        qsubCmd = ["qsub",
+        qsubCmd = ['echo', '"{}"'.format(' '.join(self.wrapperCmd)), '|',
+                 "qsub",
                  "-V",  # import environment variables from shell
-                 "-cwd",  # use current working directory
+                 #"-cwd",  # use current working directory
+                 "-q", 'fluxm',
                  "-S", sys.executable,  # The taskwrapper script is python
                  "-o", self.wrapFile,
                  "-e", self.wrapFile]
 
         qsubCmd.extend(self.schedulerArgList)
-        qsubCmd.extend(siteConfig.qsubResourceArg(self.nCores, self.memMb))
-        qsubCmd.extend(self.wrapperCmd)
 
         print qsubCmd
-        sys.exit()
+        print ' '.join(qsubCmd)
         return tuple(qsubCmd)
+
+    def runOnce(self, retInfo) :
+
+        def qcallWithTimeouts(cmd, maxQcallAttempt=1) :
+            maxQcallWait = 180
+            qcall = None
+            for i in range(maxQcallAttempt) :
+                qcall = QCaller(cmd,self.infoLog)
+                qcall.start()
+                qcall.join(maxQcallWait)
+                if not qcall.isAlive() : break
+                self.infoLog("Trial %i of sge command has timed out. Killing process for cmd '%s'" % ((i + 1), cmd))
+                qcall.killProc()
+                self.infoLog("Finished attempting to kill sge command")
+
+            return qcall.results
+
+        # 1) call qsub, check for errors and retrieve taskId:
+        #
+        if os.path.isfile(self.wrapFile): os.remove(self.wrapFile)
+
+        # write extra info, just in case we need it for post-mortem debug:
+        qsubFile = os.path.join(os.path.dirname(self.wrapFile), "qsub.args.txt")
+        if os.path.isfile(qsubFile): os.remove(qsubFile)
+        qsubfp = open(qsubFile, "w")
+        for arg in self.getFullCmd() :
+            qsubfp.write(arg + "\n")
+        qsubfp.close()
+
+        results = qcallWithTimeouts(self.getFullCmd())
+
+        isQsubError = False
+        self.jobId = None
+        if len(results.outList) != 1 :
+            isQsubError = True
+        else :
+            w = results.outList[0].split()
+            if (len(w) > 3) and (w[0] == "Your") and (w[1] == "job") :
+                self.setNewJobId(int(w[2]))
+            else :
+                isQsubError = True
+
+        if not results.isComplete :
+            self._killJob()  # just in case...
+            retInfo.taskExitMsg = ["Job submission failure -- qsub command timed-out"]
+            return retInfo
+
+        if isQsubError or (self.jobId is None):
+            retInfo.taskExitMsg = ["Unexpected qsub output. Logging %i line(s) of qsub output below:" % (len(results.outList)) ]
+            retInfo.taskExitMsg.extend([ "[qsub-out] " + line for line in results.outList ])
+            return retInfo
+
+        if results.retval != 0 :
+            retInfo.retval = results.retval
+            retInfo.taskExitMsg = ["Job submission failure -- qsub returned exit code: %i" % (retInfo.retval)]
+            return retInfo
+
+        # No qsub errors detected and an sge job_number is acquired -- success!
+        self.infoLog("Task submitted to sge queue with job_number: %i" % (self.jobId))
+
+
+        # 2) poll jobId until sge indicates it's not running or queued:
+        #
+        queueStatus = Bunch(isQueued=True, runStartTimeStamp=None)
+
+        def checkWrapFileRunStart(result) :
+            """
+            check wrapper file for a line indicating that it has transitioned from queued to
+            running state. Allow for NFS delay or incomplete file
+            """
+            if not os.path.isfile(self.wrapFile) : return
+            for line in open(self.wrapFile) :
+                w = line.strip().split()
+                if (len(w) < 6) or (w[4] != "[wrapperSignal]") :
+                    # this could be incomplete flush to the signal file, so
+                    # don't treat it as error:
+                    return
+                if w[5] == "taskStart" :
+                    result.runStartTimeStamp = timeStrToTimeStamp(w[0].strip('[]'))
+                    result.isQueued = False
+                    return
+
+
+        # exponential polling times -- make small jobs responsive but give sge a break on long runs...
+        ewaiter = ExpWaiter(5, 1.7, 60)
+
+        pollCmd = ("/bin/bash", "--noprofile", "-o", "pipefail", "-c", "qstat -j %i | awk '/^error reason/'" % (self.jobId))
+        while not self.stopped():
+            results = qcallWithTimeouts(pollCmd, 6)
+            isQstatError = False
+            if results.retval != 0:
+                if ((len(results.outList) == 2) and
+                     (results.outList[0].strip() == "Following jobs do not exist:") and
+                     (int(results.outList[1]) == self.jobId)) :
+                    break
+                else :
+                    isQstatError = True
+            else :
+                if (len(results.outList) != 0) :
+                    isQstatError = True
+
+            if isQstatError :
+                if not results.isComplete :
+                    retInfo.taskExitMsg = ["The qstat command for sge job_number %i has timed out for all attempted retries" % (self.jobId)]
+                    self._killJob()
+                else :
+                    retInfo.taskExitMsg = ["Unexpected qstat output or task has entered sge error state. Sge job_number: %i" % (self.jobId)]
+                    retInfo.taskExitMsg.extend(["Logging %i line(s) of qstat output below:" % (len(results.outList)) ])
+                    retInfo.taskExitMsg.extend([ "[qstat-out] " + line for line in results.outList ])
+                    # self._killJob() # leave the job there so the user can better diagnose whetever unexpected pattern has occurred
+                return retInfo
+
+            # also check to see if job has transitioned from queued to running state:
+            if queueStatus.isQueued :
+                checkWrapFileRunStart(queueStatus)
+                if not queueStatus.isQueued :
+                    self.setRunstate("running", queueStatus.runStartTimeStamp)
+
+            ewaiter.wait()
+
+        if self.stopped() :
+            # self._killJob() # no need, job should already have been killed at the stop() call...
+            return retInfo
+
+        lastJobId = self.jobId
+
+        # if we've correctly communicated with SGE, then its roll is done here
+        # if a job kill is required for any of the error states above, it needs to be
+        # added before this point:
+        self.jobId = None
+
+        wrapResult = self.getWrapFileResult()
+
+        if wrapResult.taskExitCode is None :
+            retInfo.taskExitMsg = ["Sge job_number: '%s'" % (lastJobId)]
+            retInfo.taskExitMsg.extend(self.getWrapperErrorMsg())
+            retInfo.retval = 1
+            return retInfo
+        elif wrapResult.taskExitCode != 0 :
+            retInfo.taskExitMsg = self.getExitMsg()
+
+        retInfo.retval = wrapResult.taskExitCode
+        retInfo.isAllowRetry = True
+
+        # success! (for sge & taskWrapper, but maybe not for the task...)
+        return retInfo
 
 
 class Runner(FluxWorkflowRunner):
@@ -272,7 +438,7 @@ class Runner(FluxWorkflowRunner):
 @click.option('--flux/--no-flux', default=False)
 @click.option('--account', '-a')
 @click.option('--ppn', '-p', default=4)
-@click.option('--mem', '-m', default='20gb')
+@click.option('--mem', '-m', default='20000') # current limitation, only handles mb
 @click.option('--walltime', '-w', default='2:00:00')
 def runner(run_dp, flux, account, ppn, mem, walltime):
     """ Analysis Workflow Management
@@ -286,7 +452,9 @@ def runner(run_dp, flux, account, ppn, mem, walltime):
     workflow_runner = Runner(run_dp=run_dp, num_cpu=ppn)
 
     if flux:
-        workflow_runner.run(mode='flux', dataDirRoot=log_output_dp)
+        if not account: sys.exit('To attempt a submission to the flux cluster you need to supply an --account/-a')
+        workflow_runner.run(mode='flux', dataDirRoot=log_output_dp, nCores=ppn, memMb=mem,
+                            schedulerArgList=['-A', account, '-l', 'nodes=1:ppn={},mem={}mb,walltime={}'.format(ppn, mem, walltime)])
 
         #full_dp = os.path.dirname(os.path.abspath(__file__))
         #activate = 'source {}'.format(os.path.join(full_dp, 'dependencies', 'miniconda', 'bin', 'activate'))
@@ -294,7 +462,7 @@ def runner(run_dp, flux, account, ppn, mem, walltime):
         #qsub = 'qsub -N omics_16s -A {} -q fluxm -l nodes=1:ppn={},mem={},walltime={}'.format(account, ppn, mem, walltime)
         #call('echo "{} && python {} {}" | {}'.format(activate, runner_fp, run_dp, qsub), shell=True)
     else:
-        workflow_runner.run(mode='local', dataDirRoot=log_output_dp)
+        workflow_runner.run(mode='local', dataDirRoot=log_output_dp, nCores=ppn, memMb=mem)
 
 
 if __name__ == "__main__":
