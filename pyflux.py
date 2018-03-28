@@ -316,9 +316,7 @@ class FluxTaskRunner(SGETaskRunner):
         qsubCmd = ['echo', '"{} {}"'.format(sys.executable, ' '.join(self.wrapperCmd)), '|',
                  "qsub",
                  "-V",  # import environment variables from shell
-                 #"-cwd",  # use current working directory
                  "-q", 'fluxm',
-                 #"-S", sys.executable,  # The taskwrapper script is python
                  "-o", self.wrapFile,
                  "-e", self.wrapFile]
 
@@ -502,13 +500,10 @@ def runner(run_dp, flux, account, ppn, mem, walltime):
     if flux:
         if not account: sys.exit('To attempt a submission to the flux cluster you need to supply an --account/-a')
         workflow_runner.run(mode='flux', dataDirRoot=log_output_dp, nCores=ppn, memMb=mem,
-                            schedulerArgList=['-A', account, '-l', 'nodes=1:ppn={},mem={}mb,walltime={}'.format(ppn, mem, walltime)])
+                            schedulerArgList=['-N', 'pyflux_runner',
+                                              '-A', account,
+                                              '-l', 'nodes=1:ppn={},mem={}mb,walltime={}'.format(ppn, mem, walltime)])
 
-        #full_dp = os.path.dirname(os.path.abspath(__file__))
-        #activate = 'source {}'.format(os.path.join(full_dp, 'dependencies', 'miniconda', 'bin', 'activate'))
-        #runner_fp = os.path.join(full_dp, 'runner.py')
-        #qsub = 'qsub -N omics_16s -A {} -q fluxm -l nodes=1:ppn={},mem={},walltime={}'.format(account, ppn, mem, walltime)
-        #call('echo "{} && python {} {}" | {}'.format(activate, runner_fp, run_dp, qsub), shell=True)
     else:
         workflow_runner.run(mode='local', dataDirRoot=log_output_dp, nCores=ppn, memMb=mem)
 
