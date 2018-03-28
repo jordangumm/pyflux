@@ -311,9 +311,10 @@ class FluxTaskRunner(SGETaskRunner):
         if len(results.outList) != 1 :
             isQsubError = True
         else :
-            w = results.outList[0].split()
-            if (len(w) > 3) and (w[0] == "Your") and (w[1] == "job") :
-                self.setNewJobId(int(w[2]))
+            w = results.outList[0].split('.')
+            if (len(w) > 3) and (w[2] == "arc-ts") and (w[3] == "umich") :
+                print 'jobId: {}'.format(w[0])
+                self.setNewJobId(int(w[0]))
             else :
                 isQsubError = True
 
