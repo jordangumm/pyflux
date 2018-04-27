@@ -3,7 +3,6 @@ import os
 import random
 import string
 
-import click
 from pyflow import WorkflowRunner, CommandTaskRunner, TaskManager, WorkflowRunnerThreadSharedData, QCaller
 from pyflow import *
 from subprocess import call
