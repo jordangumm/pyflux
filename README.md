@@ -3,7 +3,7 @@ A [pyFlow](https://github.com/Illumina/pyflow) extension for automating distribu
 
 Everything from the [pyFlow](http://illumina.github.io/pyflow/) docs should apply.
 
-Build and tested on GNU/Linux.
+Built and tested on GNU/Linux.
 
 ## Setup
 ```
@@ -18,6 +18,10 @@ Make sure you're logged into your flux account and have already set up the repo.
 $ python runner.py
 ```
 
+### Flux Run
+```
+$ python runner.py --flux -a [account/allocation_name]
+```
 
 ## Things to watch out for
 You can set core and memory requirements for tasks via the [addTask](http://illumina.github.io/pyflow/WorkflowRunner_API_html_doc/index.html) method, but make sure you coordinate that information with the task being distributed.
